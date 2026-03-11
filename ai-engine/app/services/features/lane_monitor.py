@@ -1,55 +1,64 @@
+import logging
 import cv2
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 class LaneMonitor:
     def __init__(self):
-        pass # Stateless now, line data comes with the frame
+        pass
 
-    def is_below_line(self, point, line_start, line_end):
+    def check_crossing(self, frame_shape, box, lane_data):
         """
-        Uses Cross Product to determine if a point is 'below' or 'past' the line.
+        Checks if the bottom center of the vehicle bounding box has crossed the solid line.
+        lane_data comes from the frontend as normalized coords: [[x1, y1], [x2, y2]]
         """
-        x, y = point
-        x1, y1 = line_start
-        x2, y2 = line_end
-        
-        # Cross Product check
-        val = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)
-        return val > 0
+        try:
+            if not lane_data or len(lane_data) < 2:
+                return False
 
-    def check_crossing(self, frame_size, vehicle_box, lane_points):
-        """
-        Returns True if vehicle crosses the specific lane_points provided.
-        lane_points: [[x1, y1], [x2, y2]] (Normalized 0.0-1.0)
-        """
-        if not lane_points or len(lane_points) < 2:
+            h, w = frame_shape[:2]
+            
+            # Convert frontend normalized coordinates (0.0 to 1.0) to pixel coordinates
+            p1 = np.array([lane_data[0][0] * w, lane_data[0][1] * h])
+            p2 = np.array([lane_data[1][0] * w, lane_data[1][1] * h])
+
+            # Get the bottom-center point of the vehicle's bounding box
+            bx = (box[0] + box[2]) / 2
+            by = box[3]
+            vehicle_point = np.array([bx, by])
+
+            # Calculate cross product to find which side of the line the vehicle is on
+            # This logic assumes crossing from one specific side is a violation (overtaking)
+            line_vec = p2 - p1
+            point_vec = vehicle_point - p1
+            cross_product = np.cross(line_vec, point_vec)
+
+            # Simple threshold check: if the point is very close to the line, trigger violation
+            distance = np.abs(cross_product) / np.linalg.norm(line_vec)
+            
+            # If the bottom of the car is within 15 pixels of the solid line, it's crossing
+            if distance < 15.0:
+                return True
+
             return False
 
-        h, w = frame_size
-        x1, y1, x2, y2 = vehicle_box
-        
-        # Vehicle Footprint (Bottom Center)
-        foot_x = (x1 + x2) / 2
-        foot_y = y2
+        except Exception as e:
+            logger.error(f"[LaneMonitor] Error checking lane violation: {e}", exc_info=True)
+            return False
 
-        # Convert normalized line coords to pixels
-        p1_x, p1_y = lane_points[0][0] * w, lane_points[0][1] * h
-        p2_x, p2_y = lane_points[1][0] * w, lane_points[1][1] * h
-        
-        return self.is_below_line((foot_x, foot_y), (p1_x, p1_y), (p2_x, p2_y))
+    def draw_overlay(self, frame, lane_data):
+        try:
+            if not lane_data or len(lane_data) < 2:
+                return frame
+                
+            h, w = frame.shape[:2]
+            x1, y1 = int(lane_data[0][0] * w), int(lane_data[0][1] * h)
+            x2, y2 = int(lane_data[1][0] * w), int(lane_data[1][1] * h)
 
-    def draw_overlay(self, frame, lane_points):
-        """Draws the specific line for this camera"""
-        if not lane_points or len(lane_points) < 2:
+            # Draw a thick solid red line representing the restricted lane zone
+            cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
             return frame
-
-        h, w, _ = frame.shape
-        p1 = (int(lane_points[0][0] * w), int(lane_points[0][1] * h))
-        p2 = (int(lane_points[1][0] * w), int(lane_points[1][1] * h))
-        
-        # Draw Line
-        cv2.line(frame, p1, p2, (0, 0, 255), 2)
-        cv2.circle(frame, p1, 4, (0, 255, 255), -1)
-        cv2.circle(frame, p2, 4, (0, 255, 255), -1)
-        
-        return frame
+        except Exception as e:
+            logger.error(f"[LaneMonitor] Error drawing overlay: {e}", exc_info=True)
+            return frame

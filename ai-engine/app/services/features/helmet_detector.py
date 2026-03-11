@@ -1,49 +1,47 @@
+import logging
 import cv2
-import os
-from ultralytics import YOLO
+
+logger = logging.getLogger(__name__)
 
 class HelmetDetector:
-    def __init__(self, weights_path="weights"):
-        self.model_path = f"{weights_path}/helmet_model.pt"
-        self.model = None
-        
-        if os.path.exists(self.model_path):
-            try:
-                self.model = YOLO(self.model_path)
-            except Exception as e:
-                print(f"⚠️ Helmet Model Error: {e}")
-        else:
-            print(f"⚠️ Helmet Model not found at {self.model_path}")
+    def __init__(self, helmet_model):
+        self.helmet_model = helmet_model
 
-    def check_violation(self, frame, vehicle_box):
+    def check_violation(self, frame, motorcycle_box):
         """
-        Returns True if a rider without a helmet is detected.
+        Crops the motorcycle, runs the secondary helmet model.
+        Returns True if a person is found WITHOUT a helmet (Violation).
+        Returns False if they have a helmet or if inference fails.
         """
-        if self.model is None: 
-            return False
+        try:
+            if self.helmet_model is None:
+                return False
 
-        x1, y1, x2, y2 = map(int, vehicle_box)
-        h, w, _ = frame.shape
-        
-        # Safety checks for crop boundaries
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        
-        # Crop the motorbike area
-        motorbike_crop = frame[y1:y2, x1:x2]
-        
-        if motorbike_crop.size == 0: 
-            return False
+            vx1, vy1, vx2, vy2 = map(int, motorcycle_box)
+            h, w, _ = frame.shape
+            
+            # Add padding to the crop
+            pad = 20
+            crop = frame[max(0, vy1-pad):min(h, vy2+pad), max(0, vx1-pad):min(w, vx2+pad)]
+            
+            if crop.size == 0:
+                return False
 
-        # Run Inference on the crop
-        results = self.model(motorbike_crop, verbose=False)
-        
-        for r in results:
-            for cls in r.boxes.cls:
-                class_id = int(cls)
-                # Check your model's specific class mapping!
-                # Common: 0 = Helmet, 1 = No_Helmet (Head)
-                if class_id == 1: 
-                    return True
+            # Run secondary YOLO model for helmet detection
+            results = self.helmet_model(crop, verbose=False)
+            
+            violation_found = False
+            for r in results:
+                for box, cls in zip(r.boxes.xyxy, r.boxes.cls):
+                    class_name = self.helmet_model.names[int(cls)].lower()
                     
-        return False
+                    # Check the model classes. Usually models have "no_helmet" or "helmet"
+                    if "no_helmet" in class_name or "without" in class_name:
+                        violation_found = True
+                        break
+
+            return violation_found
+
+        except Exception as e:
+            logger.error(f"[HelmetDetector] Error running helmet detection: {e}", exc_info=True)
+            return False

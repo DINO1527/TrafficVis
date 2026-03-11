@@ -8,11 +8,15 @@ import {
   AlertTriangle, 
   User, 
   FileWarning,
-  Activity
+  Activity,
+  Map,
+  Network
 } from 'lucide-react';
 
 const menuItems = [
   { name: 'Live Dashboard', href: '/', icon: LayoutDashboard },
+  { name: 'Map View', href: '/map', icon: Map },
+  { name: 'Junctions', href: '/junctions', icon: Network },
   { name: 'Violations', href: '/violations', icon: FileWarning },
   { name: 'Alerts', href: '/alerts', icon: AlertTriangle },
   { name: 'Settings', href: '/settings', icon: Settings },
@@ -34,7 +38,7 @@ export default function Sidebar() {
       </div>
 
       {/* Navigation */}
-      <nav className="flex-1 p-4 space-y-2 overflow-y-auto">
+      <nav className="flex-1 p-4 space-y-2 overflow-y-auto custom-scrollbar">
         {menuItems.map((item) => {
           const isActive = pathname === item.href;
           return (

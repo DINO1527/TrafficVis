@@ -1,129 +1,73 @@
-import time
-from collections import deque
+import logging
+import statistics
 
-class DirectionOptimizer:
-    """Handles Smoothing and Logic for ONE specific direction of a single camera."""
-    def __init__(self, capacity=20):
-        self.capacity = capacity
-        # Moving Average buffers (approx 30 seconds of history)
-        self.count_history = deque(maxlen=30) 
-        self.speed_history = deque(maxlen=30)
-        
-        # PID Coefficients for density stabilization
-        self.Kp = 0.5
-        self.Ki = 0.1
-        self.Kd = 0.05
-        
-        self.prev_error = 0
-        self.integral = 0
-        self.last_time = time.time()
-        self.smoothed_density = 0.0
+logger = logging.getLogger(__name__)
 
-    def update(self, count, speeds):
-        self.count_history.append(count)
-        
-        # Parked Vehicle Logic: 
-        # 'speeds' only contains vehicles moving > 3km/h. 
-        if len(speeds) > 0:
-            # Traffic is flowing, get the average of moving cars
-            self.speed_history.append(sum(speeds)/len(speeds))
-        elif count > 5: 
-            # High volume of cars but NO moving speeds = Traffic Jam / Gridlock
-            self.speed_history.append(0)
-        # If count is low and no speeds, they are likely just parked side-cars. Ignore them.
-        
-        ma_count = sum(self.count_history) / len(self.count_history)
-        raw_density = min(ma_count / self.capacity, 1.0)
-        
-        # PID Controller to stabilize UI flickering
-        current_time = time.time()
-        dt = max(current_time - self.last_time, 0.1)
-        error = raw_density - self.smoothed_density
-        
-        self.integral += error * dt
-        derivative = (error - self.prev_error) / dt
-        
-        adjustment = (self.Kp * error) + (self.Ki * self.integral) + (self.Kd * derivative)
-        
-        self.smoothed_density += adjustment
-        self.smoothed_density = max(0.0, min(1.0, self.smoothed_density))
-        
-        self.prev_error = error
-        self.last_time = current_time
-
-    def get_avg_speed(self):
-        if not self.speed_history: return 0
-        return int(sum(self.speed_history) / len(self.speed_history))
-        
-    def get_avg_count(self):
-        if not self.count_history: return 0
-        return int(sum(self.count_history) / len(self.count_history))
-
-class CorridorOptimizer:
-    """Dynamically combines ANY number of cameras into two directional statuses."""
+class TrafficOptimizer:
     def __init__(self):
-        # Dynamic dictionary: { 'cam_id': { 'dir1': DirectionOptimizer, 'dir2': DirectionOptimizer } }
-        self.segments = {}
+        # Stores the general traffic flow data for each camera
+        self.corridor_data = {}
 
-    def _ensure_segment(self, cam_id):
-        if cam_id not in self.segments:
-            self.segments[cam_id] = {
-                'dir1': DirectionOptimizer(capacity=20), # e.g. Lane 1 (Down)
-                'dir2': DirectionOptimizer(capacity=20)  # e.g. Lane 2 (Up)
+    def update_segment(self, cam_id, counts, current_speeds):
+        """
+        Calculates road density and congestion levels for normal roads.
+        Does NOT control traffic lights.
+        """
+        try:
+            if cam_id not in self.corridor_data:
+                self.corridor_data[cam_id] = {
+                    'total_vehicles': 0,
+                    'avg_speed_kmh': 0,
+                    'congestion_level': 'LOW',
+                    'status_text': 'Clear'
+                }
+
+            # Calculate total vehicles detected
+            total_density = counts.get('dir1', 0) + counts.get('dir2', 0)
+            
+            # Calculate average speed
+            all_speeds = current_speeds.get('dir1', []) + current_speeds.get('dir2', [])
+            avg_speed = int(statistics.mean(all_speeds)) if all_speeds else 0
+
+            # --- CONGESTION LOGIC ---
+            level = 'LOW'
+            status_text = 'Clear Flow'
+
+            if total_density > 15:
+                if avg_speed < 15:
+                    level = 'HIGH'
+                    status_text = 'Heavy Traffic / Jammed'
+                else:
+                    level = 'MEDIUM'
+                    status_text = 'Dense but Moving'
+            elif total_density > 7:
+                level = 'MEDIUM'
+                if avg_speed < 20:
+                    status_text = 'Slowing Down'
+                else:
+                    status_text = 'Moderate Traffic'
+
+            # Update state
+            self.corridor_data[cam_id] = {
+                'total_vehicles': total_density,
+                'avg_speed_kmh': avg_speed,
+                'congestion_level': level,
+                'status_text': status_text
             }
 
-    def update_segment(self, cam_id, counts_dict, speeds_dict):
-        """Called every frame by the Traffic Engine for each active camera"""
-        self._ensure_segment(cam_id)
-        self.segments[cam_id]['dir1'].update(counts_dict.get('dir1', 0), speeds_dict.get('dir1', []))
-        self.segments[cam_id]['dir2'].update(counts_dict.get('dir2', 0), speeds_dict.get('dir2', []))
+            return self.corridor_data[cam_id]
 
-    def _calculate_direction_status(self, direction_key):
-        total_density = 0.0
-        total_vehicles = 0
-        total_speed = 0
-        active_cams = 0
-
-        for cam_id, dirs in self.segments.items():
-            opt = dirs[direction_key]
-            if len(opt.count_history) > 0:
-                total_density += opt.smoothed_density
-                total_vehicles += opt.get_avg_count()
-                total_speed += opt.get_avg_speed()
-                active_cams += 1
-
-        if active_cams == 0:
-            return {
-                "status_text": "Waiting for Data", 
-                "congestion_level": "LOW",
-                "density": 0.0, 
-                "avg_speed_kmh": 0, 
-                "total_vehicles": 0
-            }
-        
-        # Average the values across all active cameras
-        avg_density = total_density / active_cams
-        overall_avg_speed = int(total_speed / active_cams)
-        
-        # Determine Status
-        if avg_density < 0.35:
-            msg, level = "Flowing Freely", "LOW"
-        elif avg_density < 0.70:
-            msg, level = "Moderate Traffic", "MEDIUM"
-        else:
-            msg, level = "Heavy Congestion", "HIGH"
-
-        return {
-            "status_text": msg,
-            "congestion_level": level,
-            "density": round(avg_density, 2),
-            "avg_speed_kmh": overall_avg_speed,
-            "total_vehicles": total_vehicles
-        }
+        except Exception as e:
+            logger.error(f"[TrafficOptimizer] Error updating segment for {cam_id}: {e}", exc_info=True)
+            return None
 
     def get_corridor_status(self):
-        """Returns the split dual-lane status to the API"""
-        return {
-            "dir1": self._calculate_direction_status('dir1'),
-            "dir2": self._calculate_direction_status('dir2')
-        }
+        """Returns the status of all roads for the dashboard health check."""
+        try:
+            status = {'junctions': {}} # Kept key name for frontend compatibility
+            for cam_id, data in self.corridor_data.items():
+                status['junctions'][cam_id] = data
+            return status
+        except Exception as e:
+            logger.error(f"[TrafficOptimizer] Error getting status: {e}", exc_info=True)
+            return {}
