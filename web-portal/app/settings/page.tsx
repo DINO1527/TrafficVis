@@ -10,7 +10,7 @@ import 'leaflet/dist/leaflet.css';
 import { 
   Save, CheckCircle2, AlertTriangle, Video, Plus, Trash2, Power, 
   MousePointer2, RefreshCw, AlertCircle, Settings2,
-  Cpu, Gauge, Zap, MapPin, BoxSelect, Map
+  Cpu, Gauge, Zap, MapPin, BoxSelect, Map, SplitSquareHorizontal
 } from 'lucide-react';
 
 // --- DYNAMIC LEAFLET IMPORTS (SSR SAFE) ---
@@ -39,6 +39,7 @@ export interface VideoSourceConfig {
   url: string;
   enabled: boolean;
   role: 'main' | 'pre' | 'post' | 'none'; 
+  feed_direction?: '1_way' | '2_way'; // NEW: Feed Direction
   lane_data?: number[][]; 
   location?: { lat: number; lng: number };
   roi_polygon?: number[][]; 
@@ -50,11 +51,8 @@ export interface VideoSourceConfig {
 }
 
 export interface SpeedLimitConfig {
-  car: number;
-  motorbike: number;
-  tuktuk: number;
-  bus: number;
-  truck: number;
+  light_vehicle: number; // NEW: Generalized Speed Limits
+  heavy_vehicle: number; 
 }
 
 export interface SystemConfig {
@@ -236,7 +234,7 @@ function VideoLaneManager({ sources, setSources }: { sources: VideoSourceConfig[
     const newId = `cam_${Date.now()}`;
     setSources([...sources, { 
       id: newId, label: "New Camera", url: "", enabled: true, role: 'none', 
-      lane_data: [], roi_polygon: [], 
+      feed_direction: '2_way', lane_data: [], roi_polygon: [], 
       enable_traffic_light: false, junction_type: 'four_way', turn_type: 'two_turn',
       location: { lat: 6.9271, lng: 79.8612 } // Default Colombo
     }]);
@@ -332,14 +330,24 @@ function VideoLaneManager({ sources, setSources }: { sources: VideoSourceConfig[
                   )}
                 </div>
 
-                <div className="flex items-center gap-2">
-                   <span className="text-xs text-slate-500">Role:</span>
-                   <select value={cam.role} onChange={(e) => updateSource(cam.id, 'role', e.target.value)} className="bg-slate-950 border border-slate-700 text-xs text-slate-300 rounded px-2 py-1 flex-1 outline-none">
-                     <option value="none">Monitoring Only</option>
-                     <option value="main">Main (Violation + PID)</option>
-                     <option value="pre">Previous (PID Flow)</option>
-                     <option value="post">Next (PID Flow)</option>
-                   </select>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="flex items-center gap-2">
+                     <span className="text-xs text-slate-500">Role:</span>
+                     <select value={cam.role} onChange={(e) => updateSource(cam.id, 'role', e.target.value)} className="bg-slate-950 border border-slate-700 text-xs text-slate-300 rounded px-2 py-1 flex-1 outline-none">
+                       <option value="none">Monitoring Only</option>
+                       <option value="main">Main (Violation + PID)</option>
+                       <option value="pre">Previous (PID Flow)</option>
+                       <option value="post">Next (PID Flow)</option>
+                     </select>
+                  </div>
+                  {/* NEW FEED DIRECTION DROPDOWN */}
+                  <div className="flex items-center gap-2">
+                     <span className="text-xs text-slate-500"><SplitSquareHorizontal size={14}/> Flow:</span>
+                     <select value={cam.feed_direction || '2_way'} onChange={(e) => updateSource(cam.id, 'feed_direction', e.target.value)} className="bg-slate-950 border border-slate-700 text-xs text-slate-300 rounded px-2 py-1 flex-1 outline-none">
+                       <option value="1_way">1-Way Road</option>
+                       <option value="2_way">2-Way Road</option>
+                     </select>
+                  </div>
                 </div>
 
                 {/* --- TRAFFIC LIGHT CONFIGURATION BLOCK --- */}
@@ -483,13 +491,6 @@ function FeatureConfig({ config, setConfig }: { config: SystemConfig; setConfig:
         setConfig(prev => ({ ...prev, [key]: !prev[key] }));
     };
 
-    const updateSpeedLimit = (vehicle: keyof SpeedLimitConfig, value: number) => {
-        setConfig(prev => ({
-            ...prev,
-            speed_limits: { ...prev.speed_limits, [vehicle]: value }
-        }));
-    };
-
     return (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
             <div className="bg-slate-900 rounded-xl border border-slate-800 p-6">
@@ -525,18 +526,31 @@ function FeatureConfig({ config, setConfig }: { config: SystemConfig; setConfig:
                     <Gauge className="text-red-500" />
                     <h3 className="text-lg font-semibold text-white">Speed Limits (km/h)</h3>
                 </div>
-                <div className="grid grid-cols-2 gap-4">
-                    {Object.entries(config.speed_limits).map(([vehicle, limit]) => (
-                        <div key={vehicle} className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                            <label className="text-xs font-bold text-slate-400 uppercase block mb-1">{vehicle}</label>
-                            <input 
-                                type="number"
-                                value={limit}
-                                onChange={(e) => updateSpeedLimit(vehicle as keyof SpeedLimitConfig, parseInt(e.target.value))}
-                                className="w-full bg-transparent text-2xl font-mono text-white font-bold outline-none border-b border-slate-800 focus:border-red-500"
-                            />
+                <div className="grid grid-cols-1 gap-4">
+                    <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 flex justify-between items-center">
+                        <div>
+                          <label className="text-sm font-bold text-slate-200 block mb-1">Light Vehicles</label>
+                          <span className="text-[10px] text-slate-500 uppercase">Cars, Bikes, TukTuks, Vans</span>
                         </div>
-                    ))}
+                        <input 
+                          type="number" 
+                          value={config.speed_limits.light_vehicle} 
+                          onChange={(e) => setConfig(prev => ({...prev, speed_limits: {...prev.speed_limits, light_vehicle: parseInt(e.target.value)}}))} 
+                          className="w-20 bg-transparent text-2xl font-mono text-white font-bold outline-none border-b border-slate-800 focus:border-red-500 text-right"
+                        />
+                    </div>
+                    <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 flex justify-between items-center">
+                        <div>
+                          <label className="text-sm font-bold text-slate-200 block mb-1">Heavy Vehicles</label>
+                          <span className="text-[10px] text-slate-500 uppercase">Buses, Trucks, Heavy Machinery</span>
+                        </div>
+                        <input 
+                          type="number" 
+                          value={config.speed_limits.heavy_vehicle} 
+                          onChange={(e) => setConfig(prev => ({...prev, speed_limits: {...prev.speed_limits, heavy_vehicle: parseInt(e.target.value)}}))} 
+                          className="w-20 bg-transparent text-2xl font-mono text-white font-bold outline-none border-b border-slate-800 focus:border-red-500 text-right"
+                        />
+                    </div>
                 </div>
             </div>
         </div>
@@ -561,13 +575,13 @@ export default function SettingsPage() {
     process_every_n_frames: 3,
     latency_mode: 'balanced',
     smoothing_factor: 0.5,
-    speed_limits: { car: 60, motorbike: 50, tuktuk: 40, bus: 40, truck: 40 },
+    speed_limits: { light_vehicle: 60, heavy_vehicle: 40 },
   });
 
   const [sources, setSources] = useState<VideoSourceConfig[]>([
-    { id: 'cam_1', label: "Main Feed", url: "C:/videos/main.mp4", enabled: true, role: 'main', lane_data: [], roi_polygon: [], enable_traffic_light: true, min_green_time: 15, max_green_time: 60, junction_type: 'four_way', turn_type: 'two_turn', location: { lat: 6.9271, lng: 79.8612 } },
-    { id: 'cam_2', label: "Left Road", url: "", enabled: true, role: 'pre', lane_data: [], roi_polygon: [], enable_traffic_light: false, junction_type: 'four_way', turn_type: 'two_turn', location: { lat: 6.9271, lng: 79.8612 } },
-    { id: 'cam_3', label: "Right Road", url: "", enabled: true, role: 'post', lane_data: [], roi_polygon: [], enable_traffic_light: false, junction_type: 'four_way', turn_type: 'two_turn', location: { lat: 6.9271, lng: 79.8612 } },
+    { id: 'cam_1', label: "Main Feed", url: "C:/videos/main.mp4", enabled: true, role: 'main', feed_direction: '2_way', lane_data: [], roi_polygon: [], enable_traffic_light: true, min_green_time: 15, max_green_time: 60, junction_type: 'four_way', turn_type: 'two_turn', location: { lat: 6.9271, lng: 79.8612 } },
+    { id: 'cam_2', label: "Left Road", url: "", enabled: true, role: 'pre', feed_direction: '2_way', lane_data: [], roi_polygon: [], enable_traffic_light: false, junction_type: 'four_way', turn_type: 'two_turn', location: { lat: 6.9271, lng: 79.8612 } },
+    { id: 'cam_3', label: "Right Road", url: "", enabled: true, role: 'post', feed_direction: '2_way', lane_data: [], roi_polygon: [], enable_traffic_light: false, junction_type: 'four_way', turn_type: 'two_turn', location: { lat: 6.9271, lng: 79.8612 } },
   ]);
 
   useEffect(() => {
@@ -576,7 +590,14 @@ export default function SettingsPage() {
     if (savedData) {
       try {
         const parsed = JSON.parse(savedData);
-        if(parsed.config) setConfig(prev => ({...prev, ...parsed.config}));
+        if(parsed.config) {
+          // Compatibility logic for old config structure migrating to Light/Heavy
+          const savedSpeed = parsed.config.speed_limits;
+          if (savedSpeed && savedSpeed.light_vehicle === undefined) {
+            parsed.config.speed_limits = { light_vehicle: savedSpeed.car || 60, heavy_vehicle: savedSpeed.truck || 40 };
+          }
+          setConfig(prev => ({...prev, ...parsed.config}));
+        }
         if(parsed.sources && Array.isArray(parsed.sources) && parsed.sources.length > 0) {
             setSources(parsed.sources);
         }

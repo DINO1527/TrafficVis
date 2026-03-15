@@ -3,11 +3,8 @@ from typing import List, Optional, Literal
 
 # 1. Sub-models for structured data
 class SpeedLimitConfig(BaseModel):
-    car: int = 60
-    motorbike: int = 50
-    tuktuk: int = 40
-    bus: int = 40
-    truck: int = 40
+    light_vehicle: int = 60  # Cars, Bikes, TukTuks, Vans
+    heavy_vehicle: int = 40  # Buses, Trucks, Heavy Machinery
 
 class VideoSourceConfig(BaseModel):
     id: str
@@ -16,7 +13,20 @@ class VideoSourceConfig(BaseModel):
     enabled: bool
     # PID Roles: 'main' = Violation + Density, 'pre'/'post' = Density Only
     role: Literal['main', 'pre', 'post', 'none'] = 'none'
+    
+    # NEW: Feed Direction
+    feed_direction: Literal['1_way', '2_way'] = '2_way'
+    
     lane_data: List[List[float]] = [] # [[x1, y1], [x2, y2]]
+    roi_polygon: List[List[float]] = []
+    
+    # Traffic Light Settings
+    enable_traffic_light: bool = False
+    min_green_time: int = 15
+    max_green_time: int = 60
+    junction_type: Literal['t_junction', 'four_way'] = 'four_way'
+    turn_type: Literal['two_turn', 'three_turn'] = 'two_turn'
+    location: Optional[dict] = None
 
 # 2. Main System Configuration
 class SystemConfig(BaseModel):

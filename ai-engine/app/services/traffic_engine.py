@@ -5,421 +5,366 @@ import time
 import os
 import uuid
 import psutil
-import torch
 import numpy as np
-from ultralytics import YOLO
+import re
 from collections import defaultdict
-from datetime import datetime
 
 # Configure robust logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("TrafficEngine")
 
-# Database & Config
+# Core Systems & Database
 from app.database import SessionLocal
 from app.models import Violation
 from app.schemas.config_schema import SystemConfig
+from app.services.core.model_manager import ModelManager
 
 # Features
 from app.services.features.speed_estimator import SpeedEstimator
 from app.services.features.lane_monitor import LaneMonitor
 from app.services.features.helmet_detector import HelmetDetector
 from app.services.features.traffic_optimizer import TrafficOptimizer 
+from app.services.features.traffic_light_controller import TrafficLightController
 
 # OCR Check
 try:
     from paddleocr import PaddleOCR
     OCR_PKG_INSTALLED = True
 except ImportError:
-    logger.warning("PaddleOCR not installed. License plate reading will be disabled.")
     OCR_PKG_INSTALLED = False
 
 class TrafficEngine:
-    def __init__(self, weights_path="weights"):
-        logger.info("Initializing Traffic Engine...")
+    def __init__(self):
+        logger.info("Initializing Refactored Traffic Engine...")
         
-        # 1. Hardware Acceleration
-        self.use_cuda = torch.cuda.is_available()
-        self.device = 0 if self.use_cuda else 'cpu'
-        logger.info(f"Using Device: {self.device}")
+        # 1. Load Core Managers
+        self.ai = ModelManager()
         
-        if self.use_cuda:
-            logger.info(f"GPU Detected: {torch.cuda.get_device_name(0)}")
-            os.environ['FLAGS_use_gpu'] = '1'
-
-        # 2. Load Models Safely
-        try:
-            self.vehicle_model = YOLO(os.path.join(weights_path, "veichle_dedaction_best_model-X.pt"))
-            if self.use_cuda: self.vehicle_model.to(self.device)
-        except Exception as e:
-            logger.error(f"Failed to load primary vehicle model: {e}")
-            self.vehicle_model = None
-
-        try:
-            self.helmet_raw_model = YOLO(os.path.join(weights_path, "helmet_model.pt"))
-            if self.use_cuda: self.helmet_raw_model.to(self.device)
-        except:
-            logger.warning("Helmet model missing. Feature will not function.")
-            self.helmet_raw_model = None
-
-        try:
-            self.plate_model = YOLO(os.path.join(weights_path, "license-plate-finetune-v1n.pt"))
-            if self.use_cuda: self.plate_model.to(self.device)
-        except:
-            logger.warning("License plate model missing.")
-            self.plate_model = None
-
-        # 3. Initialize Feature Controllers
+        # 2. Load Feature Controllers
         self.speed_est = SpeedEstimator()
         self.lane_mon = LaneMonitor()
-        self.helmet_det = HelmetDetector(self.helmet_raw_model)
-        self.optimizer = TrafficOptimizer()
+        self.helmet_det = HelmetDetector(person_model=self.ai.fallback, helmet_model=self.ai.helmet)
+        self.optimizer = TrafficOptimizer() 
+        self.light_controller = TrafficLightController() 
         
-        # 4. Initialize OCR
+        # 3. Init OCR
         self.ocr_available = False
         if OCR_PKG_INSTALLED:
             try:
-                self.ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+                self.ocr = PaddleOCR(use_angle_cls=True, lang='en')
                 self.ocr_available = True
-                logger.info("PaddleOCR Initialized successfully.")
-            except Exception as e:
-                logger.error(f"Failed to initialize OCR: {e}")
+            except: pass
 
-        # 5. State Management
+        # Categorization for Speed Limits (Using Normalized Common Names)
+        self.HEAVY_VEHICLES = ['bus', 'truck']
+        self.LIGHT_VEHICLES = ['car', 'van', 'motorbike', 'tuktuk', 'bicycle']
+
+        # State Management
         self.config = SystemConfig()
         self.running = False
         self.vehicle_history = defaultdict(list)
+        self.track_states = {} 
         self.violation_cooldown = {}
-        
-        # Multi-Cam State
         self.latest_frames = {}  
         self.lock = threading.Lock()
         
         os.makedirs("static/violations", exist_ok=True)
 
     def update_config(self, new_config: dict):
-        try:
-            self.config = SystemConfig(**new_config)
-            logger.info(f"Config Updated. Active Sources: {len(self.config.video_sources)}")
-        except Exception as e:
-            logger.error(f"Config update failed: {e}")
+        self.config = SystemConfig(**new_config)
 
     def get_health(self):
-        try:
-            return {
-                "cpu_usage": psutil.cpu_percent(interval=None),
-                "memory_usage": psutil.virtual_memory().percent,
-                "active_models": ["YOLOv11", "Helmet", "OCR"] if self.running and self.vehicle_model else [],
-                "corridor_status": self.optimizer.get_corridor_status(),
-                "fps_processed": getattr(self.config, 'frame_rate_limit', 30)
-            }
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return {}
+        combined_status = self.optimizer.get_corridor_status()
+        junction_status = {'junctions': {}}
+        if hasattr(self.light_controller, 'get_corridor_status'):
+            junction_status = self.light_controller.get_corridor_status()
+        elif hasattr(self.light_controller, 'approaches'):
+            now = time.time()
+            for cam_id, data in self.light_controller.approaches.items():
+                wait_t = int(now - data.get('red_start_time', now)) if data.get('light') == 'RED' else 0
+                junction_status['junctions'][cam_id] = {
+                    'light': data.get('light', 'RED'),
+                    'waiting_time_sec': wait_t
+                }
+        
+        for j_id, j_data in junction_status.get('junctions', {}).items():
+            if j_id in combined_status.get('junctions', {}):
+                combined_status['junctions'][j_id]['light'] = j_data.get('light', 'RED')
+                combined_status['junctions'][j_id]['waiting_time_sec'] = j_data.get('waiting_time_sec', 0)
 
-    def check_motion(self, current_frame, prev_frame):
-        """Zero-Movement Check to save GPU load"""
-        try:
-            if prev_frame is None: return True
-            gray1 = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-            gray2 = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
-            gray1 = cv2.GaussianBlur(gray1, (21, 21), 0)
-            gray2 = cv2.GaussianBlur(gray2, (21, 21), 0)
-            
-            diff = cv2.absdiff(gray1, gray2)
-            thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)[1]
-            
-            changed_pixels = cv2.countNonZero(thresh)
-            total_pixels = current_frame.shape[0] * current_frame.shape[1]
-            return (changed_pixels / total_pixels) > 0.001 
-        except Exception as e:
-            return True # Default to true on error to ensure processing
+        return {
+            "cpu_usage": psutil.cpu_percent(interval=None),
+            "memory_usage": psutil.virtual_memory().percent,
+            "active_models": ["Modular-Tracking"],
+            "corridor_status": combined_status,
+            "fps_processed": getattr(self.config, 'frame_rate_limit', 30)
+        }
+
+    def _normalize_class_name(self, raw_name):
+        """
+        Maps raw model outputs (like 'fb_car', 'tempo-traveller', 'suv') 
+        into clean, common vehicle categories.
+        """
+        clean_name = raw_name.replace('fb_', '').lower()
+        mapping = {
+            'car': 'car', 'sedan': 'car', 'suv': 'car','hatchback': 'car',
+            'motorcycle': 'motorbike', 'motorbike': 'motorbike', 'two-wheeler': 'motorbike',
+            'bus': 'bus',
+            'truck': 'truck', 'lcv': 'truck', 'heavy_vehicle': 'truck',
+            'van': 'van', 'tempo-traveller': 'van',
+            'tuktuk': 'tuktuk', 'three-wheeler': 'tuktuk',
+            'bicycle': 'bicycle', 'cycle': 'bicycle'
+        }
+        return mapping.get(clean_name, clean_name)
+
+    def format_sl_plate(self, raw_text):
+        clean = ''.join(e for e in raw_text if e.isalnum()).upper()
+        if len(clean) >= 5 and clean[-4:].isdigit(): return f"{clean[:-4]}-{clean[-4:]}"
+        return clean if len(clean) > 3 else "UNKNOWN"
 
     def read_license_plate(self, frame, vehicle_box):
-        if not self.ocr_available or not self.plate_model: return "UNKNOWN"
-        
+        if not self.ocr_available or not self.ai.plate: return "UNKNOWN"
         try:
             vx1, vy1, vx2, vy2 = map(int, vehicle_box)
             h, w, _ = frame.shape
-            pad = 10
-            vehicle_crop = frame[max(0, vy1-pad):min(h, vy2+pad), max(0, vx1-pad):min(w, vx2+pad)]
-            
+            vehicle_crop = frame[max(0, vy1-15):min(h, vy2+15), max(0, vx1-15):min(w, vx2+15)]
             if vehicle_crop.size == 0: return "UNKNOWN"
 
-            plate_results = self.plate_model(vehicle_crop, verbose=False, device=self.device)
-            best_text = "UNKNOWN"
-            
+            plate_results = self.ai.plate.predict(vehicle_crop, verbose=False, device=self.ai.device)
             for r in plate_results:
                 if len(r.boxes) > 0:
-                    box = r.boxes.xyxy[0].cpu().numpy().astype(int)
-                    px1, py1, px2, py2 = box
+                    px1, py1, px2, py2 = r.boxes.xyxy[0].cpu().numpy().astype(int)
                     plate_crop = vehicle_crop[py1:py2, px1:px2]
-                    
-                    if plate_crop.size == 0: continue
-                    
                     try:
                         ocr_result = self.ocr.ocr(plate_crop, cls=True, det=False)
                         if ocr_result and ocr_result[0]:
-                            text, conf = ocr_result[0][0]
-                            clean = ''.join(e for e in text if e.isalnum()).upper()
-                            if len(clean) > 3: best_text = clean
-                    except Exception as ocr_e:
-                        logger.error(f"OCR reading failed: {ocr_e}")
-            return best_text
-        except Exception as e:
-            logger.error(f"License plate extraction error: {e}")
+                            return self.format_sl_plate(ocr_result[0][0][0])
+                    except: pass
             return "UNKNOWN"
+        except: return "UNKNOWN"
 
-    def save_to_database(self, violation_type, vehicle_type, plate_number, speed, frame, track_id, box=None):
+    def save_to_database(self, violation_type, vehicle_type, plate_number, speed, frame, track_id, box):
         try:
-            key = f"{track_id}_{violation_type}"
-            last_time = self.violation_cooldown.get(key, 0)
-            if time.time() - last_time < 15: return # Cooldown per vehicle
+            # Global throttle to prevent database locking, actual deduplication happens in tracking state
+            key = f"global_{violation_type}"
+            if time.time() - self.violation_cooldown.get(key, 0) < 1.0: return 
             self.violation_cooldown[key] = time.time()
             
             evidence_img = frame.copy()
-            if box is not None:
-                x1, y1, x2, y2 = map(int, box)
-                cv2.rectangle(evidence_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                label_text = f"{violation_type} | {int(speed)}km/h"
-                cv2.putText(evidence_img, label_text, (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(evidence_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            cv2.putText(evidence_img, f"{violation_type} | {int(speed)}km/h", (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             filename = f"{violation_type}_{uuid.uuid4().hex[:8]}.jpg"
-            filepath = os.path.join("static/violations", filename)
-            cv2.imwrite(filepath, evidence_img)
+            cv2.imwrite(os.path.join("static/violations", filename), evidence_img)
             
-            # DB Write
             db = SessionLocal()
-            new_vio = Violation(
-                violation_type=violation_type,
-                vehicle_type=vehicle_type,
-                license_plate=plate_number,
-                speed_kph=speed,
-                evidence_path=f"/static/violations/{filename}",
-                detected_at=datetime.utcnow()
-            )
+            new_vio = Violation(violation_type=violation_type, vehicle_type=vehicle_type, license_plate=plate_number, speed_kph=speed, evidence_path=f"/static/violations/{filename}")
             db.add(new_vio)
             db.commit()
             db.close()
-            logger.info(f"🚨 VIOLATION SAVED: {violation_type} | {vehicle_type} | Plate: {plate_number}")
         except Exception as e:
-            logger.error(f"Database save error: {e}", exc_info=True)
+            logger.error(f"DB Error: {e}")
 
     def _process_stream(self, source_config):
-        """Main inference loop for a single camera feed."""
-        try:
-            cam_id = source_config.id
-            role = source_config.role 
-            lane_data = getattr(source_config, 'lane_data', [])
-            url = source_config.url
-            
-            # Traffic light configs
-            enable_tl = getattr(source_config, 'enable_traffic_light', False)
-            min_green = getattr(source_config, 'min_green_time', 15)
-            max_green = getattr(source_config, 'max_green_time', 60)
-            
-            is_main = (role == 'main')
-            src = 0 if url == "0" else url
-            cap = cv2.VideoCapture(src)
-            
-            if not cap.isOpened():
-                logger.error(f"Failed to open video source: {src}")
-                return
+        cam_id = source_config.id
+        role = source_config.role 
+        feed_direction = getattr(source_config, 'feed_direction', '2_way')
+        lane_data = getattr(source_config, 'lane_data', [])
+        roi_polygon = getattr(source_config, 'roi_polygon', [])
+        enable_tl = getattr(source_config, 'enable_traffic_light', False)
+        
+        is_main = (role == 'main')
+        
+        cap = cv2.VideoCapture(0 if source_config.url == "0" else source_config.url)
+        frame_count = 0
 
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            start_time = time.time()
-            prev_frame_gray = None
-            frame_count = 0
-            
-            VEHICLE_CLASSES = [2, 3, 5, 7] # COCO / YOLO generic classes for vehicles
-            
-            logger.info(f"Started processing stream: {cam_id}")
+        while self.running and cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: 
+                if source_config.url != "0": cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
 
-            while self.running and cap.isOpened():
-                # --- FRAME SYNC ---
-                if src != 0:
-                    elapsed = time.time() - start_time
-                    expected_frame = int(elapsed * fps)
-                    current_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
-                    if expected_frame > current_pos + 2:
-                        if expected_frame - current_pos > 30:
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, expected_frame)
-                        else:
-                            for _ in range(int(expected_frame - current_pos)): cap.grab()
+            frame_count += 1
+            
+            # --- FRONTEND DRIVEN PERFORMANCE CONTROL ---
+            skip_frames = getattr(self.config, 'process_every_n_frames', 3)
+            if skip_frames > 1 and frame_count % skip_frames != 0:
+                continue
+
+            if self.config.video_quality == 'low': frame = cv2.resize(frame, (640, 360))
+            elif self.config.video_quality == 'medium': frame = cv2.resize(frame, (854, 480))
+
+            annotated_frame = frame.copy()
+            counts = {'dir1': 0, 'dir2': 0, 'total_1way': 0}
+            tl_counts = {'dir1': 0, 'dir2': 0}
+            current_speeds = {'dir1': [], 'dir2': []}
+            
+            # Calculate the exact center X-coordinate for a vertical split
+            frame_center_x = frame.shape[1] / 2
+            
+            # Draw visual Vertical Split Line for 2-way roads
+            if feed_direction == '2_way':
+                mid_x = int(frame_center_x)
+                # Draw a thick, obvious YELLOW vertical line down the middle
+                cv2.line(annotated_frame, (mid_x, 0), (mid_x, frame.shape[0]), (0, 255, 255), 3)
                 
-                ret, frame = cap.read()
-                if not ret: 
-                    # Loop video if file
-                    if src != 0:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        start_time = time.time()
-                    continue
+                # Draw clear text labels on the Left and Right sides
+                cv2.putText(annotated_frame, "LEFT SIDE (DIR 1)", (mid_x - 220, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(annotated_frame, "RIGHT SIDE (DIR 2)", (mid_x + 20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-                frame_count += 1
-                time.sleep(1.0 / self.config.frame_rate_limit)
+            if role != 'none':
+                try:
+                    # --- AI PROCESSING (Modular) ---
+                    vehicles = self.ai.process_vehicles(frame)
 
-                if self.config.video_quality == 'low':
-                    frame = cv2.resize(frame, (640, 360))
-                elif self.config.video_quality == 'medium':
-                    frame = cv2.resize(frame, (854, 480))
-                
-                # --- MOTION CHECK ---
-                if frame_count % 5 != 0:
-                    if not self.check_motion(frame, prev_frame_gray):
-                        with self.lock: self.latest_frames[cam_id] = frame.copy()
-                        continue
-                prev_frame_gray = frame.copy()
-
-                # --- AI INFERENCE ---
-                annotated_frame = frame.copy()
-                
-                if role != 'none' and self.vehicle_model:
-                    try:
-                        results = self.vehicle_model.track(
-                            frame, persist=True, verbose=False, device=self.device, classes=VEHICLE_CLASSES
-                        )
-                        annotated_frame = results[0].plot()
+                    for v in vehicles:
+                        box, track_id, raw_class, source = v['box'], v['track_id'], v['class_name'], v['source']
                         
-                        counts = {'dir1': 0, 'dir2': 0}
+                        # Normalize to common vehicle names (e.g., car, bus, motorbike)
+                        class_name = self._normalize_class_name(raw_class)
                         
-                        if results[0].boxes.id is not None:
-                            boxes = results[0].boxes.xyxy.cpu().numpy()
-                            ids = results[0].boxes.id.int().cpu().tolist()
-                            classes = results[0].boxes.cls.int().cpu().tolist()
-                            
-                            for box, track_id, cls in zip(boxes, ids, classes):
-                                class_name = self.vehicle_model.names[cls]
-                                cx, cy = (box[0]+box[2])/2, (box[1]+box[3])/2
-                                
-                                self.vehicle_history[track_id].append({'x': cx, 'y': cy, 'time': time.time()})
-                                if len(self.vehicle_history[track_id]) > 20: self.vehicle_history[track_id].pop(0)
-                                
-                                # Direction logic
-                                direction = 'dir1'
-                                if len(self.vehicle_history[track_id]) >= 5:
-                                    dy = self.vehicle_history[track_id][-1]['y'] - self.vehicle_history[track_id][0]['y']
-                                    direction = 'dir1' if dy > 0 else 'dir2'
-                                counts[direction] += 1
-                                
-                                # SPEED ESTIMATION
-                                spd = 0
-                                if self.config.enable_speed_detection or self.config.enable_traffic_optimization:
-                                    spd = self.speed_est.estimate_speed(self.vehicle_history[track_id])
-                                    if spd > 3:
-                                        cv2.putText(annotated_frame, f"{spd}km/h", (int(box[0]), int(box[1]-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        if track_id not in self.track_states:
+                            self.track_states[track_id] = {
+                                'direction': None, 
+                                'helmet_checked': False, 
+                                'helmet_violation': False, 
+                                'plate': "UNKNOWN",
+                                'logged_violations': set() # Ensures violations are only logged ONCE per vehicle
+                            }
+                        state = self.track_states[track_id]
+                        
+                        cx, cy = (box[0]+box[2])/2, (box[1]+box[3])/2
+                        self.vehicle_history[track_id].append({'x': cx, 'y': cy, 'time': time.time()})
+                        if len(self.vehicle_history[track_id]) > 15: self.vehicle_history[track_id].pop(0)
+                        
+                        # --- SPATIAL DIRECTION LOGIC (VERTICAL SPLIT) ---
+                        if state['direction'] is None:
+                            if feed_direction == '1_way':
+                                state['direction'] = 'dir1'
+                            else:
+                                # Left side (X < Center) is dir1, Right side (X > Center) is dir2
+                                state['direction'] = 'dir1' if cx < frame_center_x else 'dir2'
+                        
+                        direction = state['direction']
+                        
+                        counts[direction] += 1
+                        counts['total_1way'] += 1
 
-                                # --- ROI FILTERING FOR TRAFFIC LIGHTS ---
-                                is_in_roi = False
-                                roi_polygon = getattr(source_config, 'roi_polygon', [])
-                                if roi_polygon and len(roi_polygon) >= 3:
-                                    # Convert normalized ROI points to pixel coordinates
-                                    h, w = frame.shape[:2]
-                                    pixel_roi = np.array([[int(p[0] * w), int(p[1] * h)] for p in roi_polygon], np.int32)
-                                    
-                                    # Check if the vehicle's bottom-center point is inside the drawn polygon
-                                    bx, by = (box[0] + box[2]) / 2, box[3]
-                                    if cv2.pointPolygonTest(pixel_roi, (bx, by), False) >= 0:
-                                        is_in_roi = True
-                                        
-                                        # Only add to density count if inside ROI and speed is low (waiting)
-                                        if spd < 10: 
-                                            counts[direction] += 1
-                                            # Draw a green dot to show AI is tracking this specific car for the light
-                                            cv2.circle(annotated_frame, (int(bx), int(by)), 5, (0, 255, 0), -1)
+                        # Draw Box (Green for Primary, Orange for Fallback)
+                        color = (0, 255, 0) if source == 'primary' else (0, 165, 255)
+                        cv2.rectangle(annotated_frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
+                        
+                        display_text = f"{class_name.upper()} (FB)" if source == 'fallback' else class_name.upper()
+                        cv2.putText(annotated_frame, display_text, (int(box[0]), int(box[1]-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-                                # MAIN CAMERA VIOLATIONS
-                                if is_main:
-                                    # 1. Speed Violation
-                                    if self.config.enable_speed_detection and spd > 0:
-                                        limit = getattr(self.config.speed_limits, class_name, 60)
-                                        if spd > limit:
-                                            plate = self.read_license_plate(frame, box)
-                                            self.save_to_database("SPEEDING", class_name, plate, spd, frame, track_id, box)
+                        # --- SPEED LOGIC ---
+                        spd = 0
+                        if self.config.enable_speed_detection or self.config.enable_traffic_optimization:
+                            spd = self.speed_est.estimate_speed(self.vehicle_history[track_id])
+                            if spd > 3:
+                                current_speeds[direction].append(spd)
+                                cv2.putText(annotated_frame, f"{spd}km/h", (int(box[0]), int(box[3]+15)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
-                                    # 2. Lane Violation
-                                    if self.config.enable_lane_violation and lane_data:
-                                        if self.lane_mon.check_crossing(frame.shape, box, lane_data):
-                                            plate = self.read_license_plate(frame, box)
-                                            self.save_to_database("LANE_CROSS", class_name, plate, spd, frame, track_id, box)
-
-                                    # 3. Helmet Violation
-                                    if self.config.enable_helmet_detection and class_name == 'motorcycle':
-                                        if self.helmet_det.check_violation(frame, box):
-                                            plate = self.read_license_plate(frame, box)
-                                            self.save_to_database("NO_HELMET", class_name, plate, spd, frame, track_id, box)
-
-                        # --- TRAFFIC LIGHT OPTIMIZATION UI ---
-                        if self.config.enable_traffic_optimization and enable_tl:
-                            # Pass only the ROI-filtered counts to the traffic light controller
-                            light_state = self.light_controller.update_light(cam_id, enable_tl, min_green, max_green, counts)
-                            if light_state:
-                                color = (0, 255, 0) if light_state['light'] == 'GREEN' else (0, 0, 255)
-                                cv2.rectangle(annotated_frame, (10, 10), (300, 70), (0,0,0), -1)
-                                cv2.circle(annotated_frame, (40, 40), 15, color, -1)
-                                cv2.putText(annotated_frame, f"LIGHT: {light_state['light']}", (70, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                                cv2.putText(annotated_frame, f"Waiting Queue: {light_state['density']} veh", (70, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
-
-                        # Draw the ROI Polygon Overlay if configured
-                        roi_polygon = getattr(source_config, 'roi_polygon', [])
+                        # --- ROI & TRAFFIC LIGHT ---
+                        is_in_roi = True
                         if roi_polygon and len(roi_polygon) >= 3:
                             h, w = frame.shape[:2]
                             pixel_roi = np.array([[int(p[0] * w), int(p[1] * h)] for p in roi_polygon], np.int32)
-                            cv2.polylines(annotated_frame, [pixel_roi], isClosed=True, color=(255, 165, 0), thickness=2)
-                            cv2.putText(annotated_frame, "AI WAITING ZONE", (pixel_roi[0][0], pixel_roi[0][1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 165, 0), 2)
+                            if cv2.pointPolygonTest(pixel_roi, (cx, box[3]), False) < 0: is_in_roi = False
 
-                        if is_main and self.config.enable_lane_violation:
-                            annotated_frame = self.lane_mon.draw_overlay(annotated_frame, lane_data)
+                        if is_in_roi and spd < 10:
+                            tl_counts[direction] += 1
+                            cv2.circle(annotated_frame, (int(cx), int(box[3])), 5, (0, 255, 0), -1) 
 
-                    except Exception as ai_e:
-                        logger.error(f"AI Inference loop error on {cam_id}: {ai_e}")
+                        # --- STRICTLY DEDUPLICATED VIOLATIONS ---
+                        if role == 'main':
+                            # Speeding
+                            if self.config.enable_speed_detection and spd > 0:
+                                limit = self.config.speed_limits.heavy_vehicle if class_name in self.HEAVY_VEHICLES else self.config.speed_limits.light_vehicle
+                                if spd > limit and "SPEEDING" not in state['logged_violations']:
+                                    if state['plate'] == "UNKNOWN": state['plate'] = self.read_license_plate(frame, box)
+                                    self.save_to_database("SPEEDING", class_name, state['plate'], spd, frame, track_id, box)
+                                    state['logged_violations'].add("SPEEDING")
 
-                with self.lock:
-                    self.latest_frames[cam_id] = annotated_frame.copy()
+                            # Lane Crossing
+                            if self.config.enable_lane_violation and lane_data:
+                                if self.lane_mon.check_crossing(frame.shape, box, lane_data):
+                                    if "LANE_CROSS" not in state['logged_violations']:
+                                        if state['plate'] == "UNKNOWN": state['plate'] = self.read_license_plate(frame, box)
+                                        self.save_to_database("LANE_CROSS", class_name, state['plate'], spd, frame, track_id, box)
+                                        state['logged_violations'].add("LANE_CROSS")
 
-            cap.release()
-            logger.info(f"Stream {cam_id} closed naturally.")
+                            # Helmet Detection
+                            if self.config.enable_helmet_detection and class_name == 'motorbike':
+                                if not state['helmet_checked'] and (box[3] - box[1]) > (frame.shape[0] * 0.15):
+                                    is_violation, heads = self.helmet_det.check_violation(frame, box)
+                                    state['helmet_checked'], state['helmet_violation'] = True, is_violation
+                                    
+                                    if is_violation and "NO_HELMET" not in state['logged_violations']:
+                                        if state['plate'] == "UNKNOWN": state['plate'] = self.read_license_plate(frame, box)
+                                        self.save_to_database("NO_HELMET", class_name, state['plate'], spd, frame, track_id, box)
+                                        state['logged_violations'].add("NO_HELMET")
+                                
+                                if state['helmet_violation']:
+                                    cv2.putText(annotated_frame, "NO HELMET", (int(box[0]), max(10, int(box[1])-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-        except Exception as e:
-            logger.critical(f"Critical stream failure on {source_config.id}: {e}", exc_info=True)
+                    # --- OPTIMIZERS & OVERLAYS ---
+                    if self.config.enable_traffic_optimization:
+                        self.optimizer.update_segment(cam_id, counts if feed_direction == '2_way' else {'dir1': counts['total_1way']}, current_speeds)
+                    
+                    if self.config.enable_traffic_optimization and enable_tl:
+                        light_state = self.light_controller.update_light(cam_id, enable_tl, getattr(source_config, 'min_green_time', 15), getattr(source_config, 'max_green_time', 60), tl_counts if feed_direction == '2_way' else {'dir1': tl_counts['dir1'] + tl_counts['dir2']})
+                        if light_state:
+                            color = (0, 255, 0) if light_state['light'] == 'GREEN' else (0, 0, 255)
+                            cv2.rectangle(annotated_frame, (10, 10), (300, 70), (0,0,0), -1)
+                            cv2.circle(annotated_frame, (40, 40), 15, color, -1)
+                            cv2.putText(annotated_frame, f"LIGHT: {light_state['light']}", (70, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+                    flow_text = f"1-Way Volume: {counts['total_1way']}" if feed_direction == '1_way' else f"2-Way Flow -> L-Side (D1): {counts['dir1']} | R-Side (D2): {counts['dir2']}"
+                    
+                    # Add a dark background rectangle to make the flow text easier to read
+                    cv2.rectangle(annotated_frame, (10, frame.shape[0] - 45), (450, frame.shape[0] - 10), (0, 0, 0), -1)
+                    cv2.putText(annotated_frame, flow_text, (20, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                    if roi_polygon and len(roi_polygon) >= 3:
+                        pixel_roi = np.array([[int(p[0] * frame.shape[1]), int(p[1] * frame.shape[0])] for p in roi_polygon], np.int32)
+                        cv2.polylines(annotated_frame, [pixel_roi], isClosed=True, color=(255, 165, 0), thickness=2)
+                        
+                    if is_main and self.config.enable_lane_violation:
+                        annotated_frame = self.lane_mon.draw_overlay(annotated_frame, lane_data)
+
+                except Exception as ai_e:
+                    logger.error(f"AI error on {cam_id}: {ai_e}", exc_info=True)
+
+            with self.lock:
+                self.latest_frames[cam_id] = annotated_frame.copy()
+
+        cap.release()
 
     def start_all(self):
         if self.running: return
         self.running = True
-        self.latest_frames = {}
-        
         for source in getattr(self.config, 'video_sources', []):
             if source.enabled:
-                t = threading.Thread(target=self._process_stream, args=(source,))
-                t.daemon = True
-                t.start()
-        logger.info("All enabled streams started.")
+                threading.Thread(target=self._process_stream, args=(source,), daemon=True).start()
 
     def stop(self):
         self.running = False
-        logger.info("System shutting down...")
 
     def generate_frames(self, cam_id=None):
-        while True:
-            try:
-                target_id = cam_id
-                if not target_id and self.latest_frames:
-                    target_id = next(iter(self.latest_frames))
-                
-                frame = None
-                with self.lock:
-                    if target_id in self.latest_frames:
-                        frame = self.latest_frames[target_id]
-                
+        try:
+            while True:
+                target_id = cam_id or (next(iter(self.latest_frames)) if self.latest_frames else None)
+                frame = self.latest_frames.get(target_id)
                 if frame is None:
                     time.sleep(0.1)
                     continue
-
-                (flag, encodedImage) = cv2.imencode(".jpg", frame)
-                if not flag: continue
-                
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
+                flag, encodedImage = cv2.imencode(".jpg", frame)
+                if flag: 
+                    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
                 time.sleep(0.05)
-            except Exception as e:
-                logger.error(f"Stream generation error: {e}")
-                time.sleep(1)
+        except GeneratorExit:
+            pass
+        except Exception as e:
+            logger.error(f"Frame generator error: {e}")
